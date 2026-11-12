@@ -1,0 +1,93 @@
+name: Compilar RubiMod
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Descomprimir el código del mod si viene en un .zip
+        run: |
+          if [ -z "$(find . -name build.gradle -not -path './.git/*' | head -1)" ]; then
+            ZIP=$(ls rubimod-source-*.zip 2>/dev/null | head -1)
+            if [ -n "$ZIP" ]; then
+              echo "Descomprimiendo $ZIP"
+              mkdir -p mod-src
+              unzip -q "$ZIP" -d mod-src
+            fi
+          fi
+
+      - name: Instalar Java 8 (necesario para Forge 1.12.2)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Instalar Gradle 4.9 (compatible con ForgeGradle 2.3)
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-4.9-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$HOME"
+          echo "$HOME/gradle-4.9/bin" >> "$GITHUB_PATH"
+
+      - name: Localizar el proyecto y elegir versión de Forge con userdev
+        run: |
+          BG=$(find . -name build.gradle -not -path './.git/*' | head -1)
+          if [ -z "$BG" ]; then
+            echo "::error::No se encontró ningún build.gradle en el repositorio"
+            find . -not -path './.git/*' | head -50
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$BG")
+          echo "Proyecto en: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          BASE="https://maven.minecraftforge.net/net/minecraftforge/forge"
+          FOUND=""
+          for N in $(seq 2860 -1 2768); do
+            VER="1.12.2-14.23.5.$N"
+            CODE=$(curl -s -o /dev/null -IL -w '%{http_code}' "$BASE/$VER/forge-$VER-userdev.jar" || true)
+            if [ "$CODE" = "200" ]; then
+              FOUND="$VER"
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::Ninguna versión de Forge 1.12.2 tiene forge-userdev.jar"
+            exit 1
+          fi
+          echo "Usando Forge $FOUND"
+          sed -i -E "s/1\.12\.2-14\.23\.5\.[0-9]+/$FOUND/" "$BG"
+          grep -n "version = " "$BG"
+
+      - name: Cache de Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/build.gradle', '*.zip') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compilar el mod
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          gradle setupCIWorkspace build --no-daemon --stacktrace --warning-mode none > build.log 2>&1 && STATUS=0 || STATUS=$?
+          echo "=== ERRORES ENCONTRADOS ==="
+          grep -n -A4 -E "error:|What went wrong|Execution failed" build.log | head -80 || true
+          echo "=== FINAL DEL LOG ==="
+          tail -n 60 build.log
+          exit $STATUS
+
+      - name: Subir el .jar del mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubimod-jar
+          path: ${{ env.PROJECT_DIR }}/build/libs/*.jar
+          if-no-files-found: error
